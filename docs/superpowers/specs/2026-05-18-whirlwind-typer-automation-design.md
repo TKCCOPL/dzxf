@@ -8,10 +8,20 @@
 
 | 决策点 | 选择 | 理由 |
 |--------|------|------|
-| 文字检测（主方案） | Windows API `GetWindowText` + UI Automation | 准确率 100%，毫秒级响应 |
-| 文字检测（兜底） | 截图 + Tesseract OCR | API 失败时的后备方案 |
-| 键盘模拟 | pyautogui 全局键盘模拟 | 兼容性最好，Delphi 老应用 WM_CHAR 可能无效 |
+| 文字检测（主方案） | 截图 + Tesseract OCR | 程序为 MFC 自绘控件（AfxWnd42s），GetWindowText 始终返回空 |
+| 文字检测（兜底） | Windows API `GetWindowText` | 老控件偶尔可读，作为快速路径 |
+| 键盘模拟 | pyautogui 全局键盘模拟 | 兼容性最好，MFC 老应用 WM_CHAR 可能无效 |
 | GUI 框架 | customtkinter | 现代外观，API 与 tkinter 一致，依赖轻（<2MB） |
+
+### 根因探测结论
+
+| 发现 | 结论 |
+|------|------|
+| 窗口标题 | "打字旋风"，MFC 对话框（#32770） |
+| 控件类名 | `AfxWnd42s` + `SPGInputAreaGrayClass` |
+| GetWindowText | 所有子控件均返回空 |
+| UIA (pywinauto) | 后代元素为 0，未实现无障碍接口 |
+| **唯一可行方案** | 截图 + Tesseract OCR |
 
 ## 架构
 
@@ -31,26 +41,28 @@
 │  └────────────┘  └────────────┘  └──────────┘  │
 │       │                │                │       │
 │       ▼                ▼                ▼       │
-│  WhirlwindTyper    屏幕文字区域    系统键盘缓冲区  │
-│     窗口句柄       (API + OCR)    (pyautogui)    │
+│  WhirlwindTyper    截图 + OCR       系统键盘缓冲区  │
+│     窗口句柄       (主方案)        (pyautogui)    │
 └─────────────────────────────────────────────────┘
 ```
 
 ### 模块职责
 
 **WindowLocator（窗口定位器）**
-- 通过窗口标题或进程名查找 WhirlwindTyper 主窗口句柄
-- 枚举子窗口，定位文字显示区域（目标控件）
-- 使用 `win32gui.FindWindow`、`EnumChildWindows`
+- 通过窗口标题 "打字旋风"/"旋风"/"Whirlwind" 查找主窗口句柄
+- 查找文字显示区域：优先 API 可读控件，找不到则取面积最大子控件供 OCR 截图
+- 使用 `win32gui.EnumWindows`、`EnumChildWindows`
 
 **TextDetector（文字检测器）**
-- 主方案：`GetWindowText` 直接从文字控件抓取文本
-- 兜底方案：`pyautogui.screenshot` 截取文字区域 + Tesseract OCR
-- 输入法类型判断：检测文本是否为纯中文/纯英文/中英混合/数字，用于选择合适的键盘输入方式
+- 主方案：截图 + Tesseract OCR（chi_sim+eng 中英混合）
+- 兜底方案：`GetWindowText`（作为快速路径，老控件偶尔可用）
+- Tesseract 路径自动探测：PATH → Program Files → LocalAppData
+- 语言包自动选择：检测已安装语言，chi_sim 未装时退回 eng
+- 中文 Unicode 范围覆盖 CJK Basic + Extension A（㐀-䶿）
 
 **KeyboardEmulator（键盘模拟器）**
 - 英文字母/数字/符号：`pyautogui.typewrite` 逐字符发送
-- 中文：拷贝至剪贴板 → `Ctrl+V` 粘贴
+- 中文：累积连续中文字符，拷贝至剪贴板 → `Ctrl+V` 粘贴
 - 支持速度调节（字/分钟），通过字符间延迟控制
 
 ## 两种工作模式
@@ -58,22 +70,22 @@
 ### 模式一：手动练习
 
 ```
-用户手动选文章并开始 → 脚本检测窗口已有文字 → 自动打字
+用户手动选文章并开始 → 脚本截图 OCR 识别文字 → 自动打字
 ```
 
 - 用户自行在 WhirlwindTyper 中选择练习内容并开始
-- 点击 GUI "开始" 按钮后，脚本立即检测文字区域内容
-- 检测到文字后直接开始打字，打完自动停止
+- 点击 GUI "开始" 按钮后，脚本截图文字区域并 OCR 识别
+- 识别到文字后直接开始打字，打完自动停止
 - 适用场景：单机模式（ConnectMode=1），练习本地素材
 
 ### 模式二：服务器下发（网络模式）
 
 ```
-持续监控窗口文字 → 检测到新文章(内容变化) → 自动打字 → 打完继续监控
+持续监控窗口文字 → OCR 检测新文章(内容变化) → 自动打字 → 打完继续监控
 ```
 
 - 脚本启动后进入**持续监控**状态
-- 每 1 秒检查一次文字区域内容
+- 每 1.5 秒截图 OCR 检查一次文字区域内容
 - 当检测到文字内容发生变化（新文章下发），自动开始打字
 - 打完当前文章后，回到监控状态，等待下一篇
 - 适用场景：网络模式（ConnectMode=2），服务器随机分发文章
@@ -94,17 +106,10 @@
 │                                    │
 │  当前文章预览:                      │
 │  ┌──────────────────────────────┐  │
-│  │ (检测到的文字内容预览)         │  │
+│  │ (OCR 识别到的文字内容预览)      │  │
 │  └──────────────────────────────┘  │
 └────────────────────────────────────┘
 ```
-
-- 模式切换：单选按钮或分段开关
-- 速度调节：`CTkSlider`，范围 10-300 字/分钟，默认 80
-- 状态栏：实时显示当前状态（监控中/打字中/已完成/错误）
-- 文章预览框：显示检测到的前几行文字
-- 模式一按钮文本为 "开始"，模式二按钮文本为 "开始监控"
-- 暂停按钮在两种模式下通用
 
 ## 数据流
 
@@ -112,17 +117,18 @@
 ```
 1. 用户点击"开始"按钮
 2. AutomationCore 调用 WindowLocator → 获取目标窗口句柄
-3. AutomationCore 调用 TextDetector → 获取当前文章文字
-4. 文字显示在预览框，通知 KeyboardEmulator 开始打字
-5. KeyboardEmulator 逐字符输出，间隔由速度设置决定
-6. 所有字符发送完毕 → 状态更新"已完成"
+3. WindowLocator 找最大子控件 → 定位截图区域
+4. TextDetector 截图 + Tesseract OCR → 获取当前文章文字
+5. 文字显示在预览框，通知 KeyboardEmulator 开始打字
+6. KeyboardEmulator 逐字符输出，间隔由速度设置决定
+7. 所有字符发送完毕 → 状态更新"已完成"
 ```
 
 ### 服务器下发模式的循环流程
 ```
 1. 用户点击"开始监控"按钮
-2. [监控循环] 每 1 秒：
-   a. TextDetector 抓取当前文字
+2. [监控循环] 每 1.5 秒：
+   a. TextDetector OCR 抓取当前文字
    b. 与上次记录的文字比对
    c. 如果不同（新文章出现）→ 进入步骤 3
 3. 文字显示在预览框，通知 KeyboardEmulator 开始打字
@@ -133,30 +139,30 @@
 ## 线程模型
 
 - **主线程**：gui 事件循环
-- **监控线程**：定时检测文字（daemon，随主线程退出）
+- **监控线程**：定时 OCR 检测文字（daemon，随主线程退出）
 - **打字线程**：执行键盘模拟（daemon，可通过暂停中断）
 
-线程间通过 `threading.Event` 和 `queue.Queue` 通信：
+线程间通过 `threading.Event` 通信：
 - `pause_event`：打字线程检查此事件，设置时暂停输出
 - `stop_event`：打字线程检查此事件，设置时终止
-- `text_queue`：监控线程发现新文章时推入，打字线程消费
 
 ## 错误处理
 
-- 窗口未找到：提示用户确认 WhirlwindTyper 已启动，重试直到超时
-- 文字检测失败：API 方案失败后自动回落 OCR，OCR 也失败则提示用户手动标定文字区域
-- 键盘模拟异常：捕获 pyautogui 异常，显示错误信息，允许重试
+- 窗口未找到：提示用户确认 WhirlwindTyper 已启动
+- 文字检测失败：Tesseract 未安装时提示，无中文语言包时退回英文 OCR
+- 键盘模拟异常：捕获 pyautogui 异常，显示错误信息
 - 线程安全：所有 GUI 更新通过 `after()` 调度到主线程
 
 ## 依赖项
 
 ```
 pywin32       - Windows API 调用（窗口查找、GetWindowText）
-pyautogui     - 键盘模拟
+pyautogui     - 截图 + 键盘模拟
+pyperclip     - 剪贴板操作（中文粘贴）
 customtkinter - GUI 界面
-tkinter       - GUI 基础（Python 自带）
-Pillow        - 截图处理（OCR 兜底方案需要）
-pytesseract   - OCR 引擎（可选，仅兜底时启用）
+Pillow        - 截图处理
+pytesseract   - OCR 引擎 Python 绑定
+Tesseract-OCR - OCR 引擎桌面程序（需单独安装，含 chi_sim 语言包）
 ```
 
 ## 文件结构
@@ -165,7 +171,7 @@ pytesseract   - OCR 引擎（可选，仅兜底时启用）
 dzxf/
 ├── auto_type.py          # 主入口 + GUI
 ├── window_locator.py     # 窗口查找模块
-├── text_detector.py      # 文字检测模块
+├── text_detector.py      # 文字检测模块（OCR 主方案）
 ├── keyboard_emulator.py  # 键盘模拟模块
 └── README.md
 ```
